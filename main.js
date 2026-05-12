@@ -1,6 +1,4 @@
 const obsidian = require('obsidian');
-const http = require('http');
-const crypto = require('crypto');
 const { diff_match_patch } = require('./diff_match_patch.js');
 
 const DEFAULT_SETTINGS = {
@@ -11,12 +9,24 @@ const DEFAULT_SETTINGS = {
     syncInterval: 2, // Default 2 minutes
 };
 
-// Utility to generate HMAC for authentication
-function generateHMAC(secret, data) {
-    return crypto.createHmac('sha256', secret).update(data).digest('hex');
+// Web Crypto API is available on both Desktop and Mobile
+async function generateHMAC(secret, data) {
+    const enc = new TextEncoder();
+    const key = await window.crypto.subtle.importKey(
+        "raw",
+        enc.encode(secret),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    );
+    const signature = await window.crypto.subtle.sign("HMAC", key, enc.encode(data));
+    return Array.from(new Uint8Array(signature))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
 }
 
 // --- Minimal WebSocket Server Implementation ---
+// Only called on Desktop where Buffer is available
 function sendWS(socket, text) {
     if (socket.destroyed) return;
     const payload = Buffer.from(text, 'utf8');
@@ -110,7 +120,7 @@ class LocalSyncPlugin extends obsidian.Plugin {
     async onunload() {
         if (this.server) this.server.close();
         if (this.wsClient) this.wsClient.close();
-        if (this.syncIntervalID) clearInterval(this.syncIntervalID);
+        if (this.syncIntervalID) window.clearInterval(this.syncIntervalID);
         await this.saveSyncHistory();
     }
 
@@ -126,7 +136,7 @@ class LocalSyncPlugin extends obsidian.Plugin {
     initializeNetwork() {
         if (this.server) { this.server.close(); this.server = null; }
         if (this.wsClient) { this.wsClient.close(); this.wsClient = null; }
-        if (this.syncIntervalID) clearInterval(this.syncIntervalID);
+        if (this.syncIntervalID) window.clearInterval(this.syncIntervalID);
         
         if (this.settings.serverMode) {
             this.startServer();
@@ -136,7 +146,7 @@ class LocalSyncPlugin extends obsidian.Plugin {
 
         // Setup interval-based periodic sync
         if (this.settings.syncInterval > 0) {
-            this.syncIntervalID = setInterval(() => {
+            this.syncIntervalID = window.setInterval(() => {
                 this.forceSync();
             }, this.settings.syncInterval * 60 * 1000);
         }
@@ -162,6 +172,17 @@ class LocalSyncPlugin extends obsidian.Plugin {
 
     // --- Network: Server ---
     startServer() {
+        let http, cryptoNode;
+        try {
+            http = require('http');
+            cryptoNode = require('crypto');
+        } catch (e) {
+            new obsidian.Notice("Server mode is only supported on Desktop Obsidian.");
+            this.settings.serverMode = false;
+            this.saveSettings();
+            return;
+        }
+
         this.server = http.createServer((req, res) => {
             res.writeHead(404);
             res.end();
@@ -171,15 +192,14 @@ class LocalSyncPlugin extends obsidian.Plugin {
             const key = req.headers['sec-websocket-key'];
             if (!key) { socket.end(); return; }
             
-            const hash = crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+            const hash = cryptoNode.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
             socket.write('HTTP/1.1 101 Switching Protocols\r\n' +
                          'Upgrade: websocket\r\n' +
                          'Connection: Upgrade\r\n' +
                          'Sec-WebSocket-Accept: ' + hash + '\r\n\r\n');
 
             socket.isAuthenticated = false;
-            // Send challenge
-            const challenge = crypto.randomBytes(16).toString('hex');
+            const challenge = cryptoNode.randomBytes(16).toString('hex');
             socket.challenge = challenge;
             sendWS(socket, JSON.stringify({ type: 'AUTH_CHALLENGE', challenge }));
 
@@ -194,11 +214,11 @@ class LocalSyncPlugin extends obsidian.Plugin {
         });
     }
 
-    handleServerMessage(socket, msgStr) {
+    async handleServerMessage(socket, msgStr) {
         try {
             const msg = JSON.parse(msgStr);
             if (msg.type === 'AUTH_RESPONSE') {
-                const expectedHMAC = generateHMAC(this.settings.sharedSecret, socket.challenge);
+                const expectedHMAC = await generateHMAC(this.settings.sharedSecret, socket.challenge);
                 if (msg.hmac === expectedHMAC) {
                     socket.isAuthenticated = true;
                     this.clients.add(socket);
@@ -212,26 +232,27 @@ class LocalSyncPlugin extends obsidian.Plugin {
             if (!socket.isAuthenticated) return;
 
             if (msg.type === 'FILE_UPDATE') {
-                this.processIncomingFileUpdate(msg.path, msg.content, msg.mtime);
+                await this.processIncomingFileUpdate(msg.path, msg.content, msg.mtime);
                 // Broadcast to other clients
                 for (const client of this.clients) {
                     if (client !== socket) sendWS(client, msgStr);
                 }
             } else if (msg.type === 'REQUEST_MANIFEST') {
-                this.generateManifest().then(manifest => {
-                    sendWS(socket, JSON.stringify({ type: 'MANIFEST', manifest }));
-                });
+                const manifest = await this.generateManifest();
+                sendWS(socket, JSON.stringify({ type: 'MANIFEST', manifest }));
             } else if (msg.type === 'REQUEST_FILE') {
-                this.app.vault.adapter.read(msg.path).then(content => {
-                    this.app.vault.adapter.stat(msg.path).then(stat => {
-                        sendWS(socket, JSON.stringify({
-                            type: 'FILE_UPDATE',
-                            path: msg.path,
-                            content,
-                            mtime: stat.mtime
-                        }));
-                    });
-                }).catch(() => {});
+                try {
+                    const content = await this.app.vault.adapter.read(msg.path);
+                    const stat = await this.app.vault.adapter.stat(msg.path);
+                    sendWS(socket, JSON.stringify({
+                        type: 'FILE_UPDATE',
+                        path: msg.path,
+                        content,
+                        mtime: stat.mtime
+                    }));
+                } catch (e) {
+                    // Ignore file read errors
+                }
             }
         } catch (e) {
             console.error("Server Message Error", e);
@@ -241,20 +262,29 @@ class LocalSyncPlugin extends obsidian.Plugin {
     // --- Network: Client ---
     connectClient() {
         const url = `ws://${this.settings.serverIP}:${this.settings.serverPort}`;
-        this.wsClient = new WebSocket(url);
+        try {
+            this.wsClient = new WebSocket(url);
+        } catch (e) {
+            console.error("WebSocket connection failed", e);
+            return;
+        }
 
-        this.wsClient.onmessage = (event) => {
-            const msg = JSON.parse(event.data);
-            if (msg.type === 'AUTH_CHALLENGE') {
-                const hmac = generateHMAC(this.settings.sharedSecret, msg.challenge);
-                this.wsClient.send(JSON.stringify({ type: 'AUTH_RESPONSE', hmac }));
-            } else if (msg.type === 'AUTH_SUCCESS') {
-                new obsidian.Notice('Connected to Local Sync Server');
-                this.forceSync(); // Auto sync on connect
-            } else if (msg.type === 'FILE_UPDATE') {
-                this.processIncomingFileUpdate(msg.path, msg.content, msg.mtime);
-            } else if (msg.type === 'MANIFEST') {
-                this.reconcileManifest(msg.manifest);
+        this.wsClient.onmessage = async (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'AUTH_CHALLENGE') {
+                    const hmac = await generateHMAC(this.settings.sharedSecret, msg.challenge);
+                    this.wsClient.send(JSON.stringify({ type: 'AUTH_RESPONSE', hmac }));
+                } else if (msg.type === 'AUTH_SUCCESS') {
+                    new obsidian.Notice('Connected to Local Sync Server');
+                    this.forceSync(); // Auto sync on connect
+                } else if (msg.type === 'FILE_UPDATE') {
+                    await this.processIncomingFileUpdate(msg.path, msg.content, msg.mtime);
+                } else if (msg.type === 'MANIFEST') {
+                    await this.reconcileManifest(msg.manifest);
+                }
+            } catch (e) {
+                console.error("Client onmessage Error", e);
             }
         };
 
@@ -317,13 +347,16 @@ class LocalSyncPlugin extends obsidian.Plugin {
             const remoteMtime = remoteManifest[path];
 
             if (!remoteMtime || localMtime > remoteMtime) {
-                const content = await this.app.vault.adapter.read(path);
-                this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
+                try {
+                    const content = await this.app.vault.adapter.read(path);
+                    this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
+                } catch (e) {}
             }
         }
     }
 
     async processIncomingFileUpdate(path, newContent, remoteMtime) {
+        if (this.isSyncing) return;
         this.isSyncing = true;
         try {
             const file = this.app.vault.getAbstractFileByPath(path);
