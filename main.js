@@ -2352,6 +2352,21 @@ class LocalSyncPlugin extends obsidian.Plugin {
 
         // Setup Network
         this.initializeNetwork();
+
+        this.registerEvent(
+            this.app.vault.on('delete', async (file) => {
+                if (this.isSyncing) return;
+                if (file instanceof obsidian.TFile) {
+                    const path = file.path;
+                    const historyVal = this.syncHistory[path] || 0;
+                    const mtime = file.stat.mtime || Math.abs(historyVal) || Date.now();
+                    this.syncHistory[path] = -mtime;
+                    await this.saveSyncHistory();
+                    
+                    this.broadcastMessage({ type: 'FILE_DELETE', path });
+                }
+            })
+        );
     }
 
     async onunload() {
@@ -2401,6 +2416,13 @@ class LocalSyncPlugin extends obsidian.Plugin {
 
     async saveSyncHistory() {
         try {
+            const thirtyDaysAgo = Date.now() - 30 * 24 * 60 * 60 * 1000;
+            for (const path in this.syncHistory) {
+                const val = this.syncHistory[path];
+                if (val < 0 && Math.abs(val) < thirtyDaysAgo) {
+                    delete this.syncHistory[path];
+                }
+            }
             await this.app.vault.adapter.write('.obsidian/sync-history.json', JSON.stringify(this.syncHistory));
         } catch (e) {
             console.error("Failed to save sync history", e);
@@ -2474,6 +2496,12 @@ class LocalSyncPlugin extends obsidian.Plugin {
                 for (const client of this.clients) {
                     if (client !== socket) sendWS(client, msgStr);
                 }
+            } else if (msg.type === 'FILE_DELETE') {
+                await this.processIncomingFileDelete(msg.path);
+                // Broadcast to other clients
+                for (const client of this.clients) {
+                    if (client !== socket) sendWS(client, msgStr);
+                }
             } else if (msg.type === 'REQUEST_MANIFEST') {
                 const manifest = await this.generateManifest();
                 sendWS(socket, JSON.stringify({ type: 'MANIFEST', manifest }));
@@ -2517,6 +2545,8 @@ class LocalSyncPlugin extends obsidian.Plugin {
                     this.forceSync(); // Auto sync on connect
                 } else if (msg.type === 'FILE_UPDATE') {
                     await this.processIncomingFileUpdate(msg.path, msg.content, msg.mtime);
+                } else if (msg.type === 'FILE_DELETE') {
+                    await this.processIncomingFileDelete(msg.path);
                 } else if (msg.type === 'MANIFEST') {
                     await this.reconcileManifest(msg.manifest);
                 }
@@ -2567,23 +2597,62 @@ class LocalSyncPlugin extends obsidian.Plugin {
     async reconcileManifest(remoteManifest) {
         const localManifest = await this.generateManifest();
 
-        // Check for files to pull
+        // Check for files to pull or remote files to delete
         for (const path in remoteManifest) {
             const remoteMtime = remoteManifest[path];
             const localMtime = localManifest[path];
+            const historyVal = this.syncHistory[path] || 0;
+            const historyMtime = Math.abs(historyVal);
+            const isDeletedLocally = historyVal < 0;
 
-            if (!localMtime || remoteMtime > localMtime) {
-                // Request file from server
+            if (!localMtime) {
+                if (isDeletedLocally) {
+                    if (remoteMtime > historyMtime) {
+                        this.broadcastMessage({ type: 'REQUEST_FILE', path });
+                    } else {
+                        this.broadcastMessage({ type: 'FILE_DELETE', path });
+                    }
+                } else if (historyVal === 0) {
+                    this.broadcastMessage({ type: 'REQUEST_FILE', path });
+                } else {
+                    this.broadcastMessage({ type: 'FILE_DELETE', path });
+                    this.syncHistory[path] = -historyMtime;
+                    await this.saveSyncHistory();
+                }
+            } else if (remoteMtime > localMtime) {
                 this.broadcastMessage({ type: 'REQUEST_FILE', path });
             }
         }
 
-        // Check for files to push
+        // Check for files to push or local files to delete
         for (const path in localManifest) {
             const localMtime = localManifest[path];
             const remoteMtime = remoteManifest[path];
+            const historyVal = this.syncHistory[path] || 0;
+            const historyMtime = Math.abs(historyVal);
 
-            if (!remoteMtime || localMtime > remoteMtime) {
+            if (!remoteMtime) {
+                if (historyVal > 0) {
+                    if (localMtime > historyMtime) {
+                        try {
+                            const content = await this.app.vault.adapter.read(path);
+                            this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
+                        } catch (e) {}
+                    } else {
+                        await this.processIncomingFileDelete(path);
+                    }
+                } else if (historyVal < 0) {
+                    try {
+                        const content = await this.app.vault.adapter.read(path);
+                        this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
+                    } catch (e) {}
+                } else {
+                    try {
+                        const content = await this.app.vault.adapter.read(path);
+                        this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
+                    } catch (e) {}
+                }
+            } else if (localMtime > remoteMtime) {
                 try {
                     const content = await this.app.vault.adapter.read(path);
                     this.broadcastMessage({ type: 'FILE_UPDATE', path, content, mtime: localMtime });
@@ -2599,7 +2668,7 @@ class LocalSyncPlugin extends obsidian.Plugin {
             const file = this.app.vault.getAbstractFileByPath(path);
             if (file && file instanceof obsidian.TFile) {
                 const localMtime = file.stat.mtime;
-                const lastSynced = this.syncHistory[path] || 0;
+                const lastSynced = Math.abs(this.syncHistory[path] || 0);
 
                 // Conflict Resolution Logic
                 if (localMtime > lastSynced && localMtime !== remoteMtime) {
@@ -2643,6 +2712,31 @@ class LocalSyncPlugin extends obsidian.Plugin {
             }
         } catch (e) {
             console.error("Error applying file update:", e);
+        } finally {
+            this.isSyncing = false;
+        }
+    }
+
+    async processIncomingFileDelete(path) {
+        if (this.isSyncing) return;
+        this.isSyncing = true;
+        try {
+            const file = this.app.vault.getAbstractFileByPath(path);
+            if (file && file instanceof obsidian.TFile) {
+                const mtime = file.stat.mtime;
+                await this.app.vault.delete(file);
+                this.syncHistory[path] = -mtime;
+                await this.saveSyncHistory();
+                new obsidian.Notice(`Deleted ${path} (synced)`);
+            } else {
+                const historyVal = this.syncHistory[path] || 0;
+                if (historyVal >= 0) {
+                    this.syncHistory[path] = -Math.abs(historyVal || Date.now());
+                    await this.saveSyncHistory();
+                }
+            }
+        } catch (e) {
+            console.error("Error applying file deletion:", e);
         } finally {
             this.isSyncing = false;
         }
