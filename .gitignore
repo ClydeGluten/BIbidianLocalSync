@@ -1,0 +1,10 @@
+# Obsidian plugin local data
+data.json
+.obsidian/
+
+# vim backup files
+*.un~
+*.swp
+
+# OS generated files
+.DS_Store

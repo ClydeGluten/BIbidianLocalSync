@@ -2244,6 +2244,8 @@ const DEFAULT_SETTINGS = {
     serverIP: '127.0.0.1',
     serverPort: 8080,
     syncInterval: 2, // Default 2 minutes
+    liveSync: true,
+    maxBackups: 5,
 };
 
 // Web Crypto API is available on both Desktop and Mobile
@@ -2341,6 +2343,7 @@ class LocalSyncPlugin extends obsidian.Plugin {
         this.clients = new Set();
         this.wsClient = null;
         this.syncIntervalID = null;
+        this.modifyDebounceTimers = new Map();
 
         this.addSettingTab(new LocalSyncSettingTab(this.app, this));
 
@@ -2350,8 +2353,75 @@ class LocalSyncPlugin extends obsidian.Plugin {
             callback: () => this.forceSync()
         });
 
+        this.addCommand({
+            id: 'flush-local-sync',
+            name: 'Flush Local Sync (Push Local Vault)',
+            callback: () => {
+                if (confirm("Are you sure you want to flush? This will replace all files on other devices with this device's files.")) {
+                    this.initiateFlush();
+                }
+            }
+        });
+
         // Setup Network
         this.initializeNetwork();
+
+        this.registerEvent(
+            this.app.vault.on('modify', async (file) => {
+                if (!this.settings.liveSync) return;
+                if (this.isSyncing) return;
+                if (!(file instanceof obsidian.TFile)) return;
+
+                const path = file.path;
+                if (this.modifyDebounceTimers.has(path)) {
+                    clearTimeout(this.modifyDebounceTimers.get(path));
+                }
+
+                const timer = setTimeout(async () => {
+                    this.modifyDebounceTimers.delete(path);
+                    if (this.isSyncing) return;
+                    try {
+                        const content = await this.app.vault.read(file);
+                        const mtime = file.stat.mtime;
+                        this.syncHistory[path] = mtime;
+                        await this.saveSyncHistory();
+                        this.broadcastMessage({
+                            type: 'FILE_UPDATE',
+                            path,
+                            content,
+                            mtime
+                        });
+                    } catch (e) {
+                        console.error("Failed to read file for live sync modify:", e);
+                    }
+                }, 1000);
+                this.modifyDebounceTimers.set(path, timer);
+            })
+        );
+
+        this.registerEvent(
+            this.app.vault.on('create', async (file) => {
+                if (!this.settings.liveSync) return;
+                if (this.isSyncing) return;
+                if (!(file instanceof obsidian.TFile)) return;
+
+                const path = file.path;
+                try {
+                    const content = await this.app.vault.read(file);
+                    const mtime = file.stat.mtime;
+                    this.syncHistory[path] = mtime;
+                    await this.saveSyncHistory();
+                    this.broadcastMessage({
+                        type: 'FILE_UPDATE',
+                        path,
+                        content,
+                        mtime
+                    });
+                } catch (e) {
+                    console.error("Failed to read file for live sync create:", e);
+                }
+            })
+        );
 
         this.registerEvent(
             this.app.vault.on('delete', async (file) => {
@@ -2363,7 +2433,9 @@ class LocalSyncPlugin extends obsidian.Plugin {
                     this.syncHistory[path] = -mtime;
                     await this.saveSyncHistory();
                     
-                    this.broadcastMessage({ type: 'FILE_DELETE', path });
+                    if (this.settings.liveSync) {
+                        this.broadcastMessage({ type: 'FILE_DELETE', path });
+                    }
                 }
             })
         );
@@ -2502,6 +2574,12 @@ class LocalSyncPlugin extends obsidian.Plugin {
                 for (const client of this.clients) {
                     if (client !== socket) sendWS(client, msgStr);
                 }
+            } else if (msg.type === 'FLUSH_MANIFEST') {
+                await this.reconcileFlushManifest(msg.manifest);
+                // Broadcast to other clients
+                for (const client of this.clients) {
+                    if (client !== socket) sendWS(client, msgStr);
+                }
             } else if (msg.type === 'REQUEST_MANIFEST') {
                 const manifest = await this.generateManifest();
                 sendWS(socket, JSON.stringify({ type: 'MANIFEST', manifest }));
@@ -2549,6 +2627,8 @@ class LocalSyncPlugin extends obsidian.Plugin {
                     await this.processIncomingFileDelete(msg.path);
                 } else if (msg.type === 'MANIFEST') {
                     await this.reconcileManifest(msg.manifest);
+                } else if (msg.type === 'FLUSH_MANIFEST') {
+                    await this.reconcileFlushManifest(msg.manifest);
                 }
             } catch (e) {
                 console.error("Client onmessage Error", e);
@@ -2666,12 +2746,14 @@ class LocalSyncPlugin extends obsidian.Plugin {
         this.isSyncing = true;
         try {
             const file = this.app.vault.getAbstractFileByPath(path);
+            const isFlushUpdate = this.pendingFlushRequests && this.pendingFlushRequests.has(path);
+
             if (file && file instanceof obsidian.TFile) {
                 const localMtime = file.stat.mtime;
                 const lastSynced = Math.abs(this.syncHistory[path] || 0);
 
-                // Conflict Resolution Logic
-                if (localMtime > lastSynced && localMtime !== remoteMtime) {
+                // Conflict Resolution Logic (Bypassed if this is a flush update)
+                if (!isFlushUpdate && localMtime > lastSynced && localMtime !== remoteMtime) {
                     // Local has offline changes. CONFLICT!
                     const localContent = await this.app.vault.read(file);
                     
@@ -2710,6 +2792,14 @@ class LocalSyncPlugin extends obsidian.Plugin {
                 this.syncHistory[path] = newFile.stat.mtime;
                 await this.saveSyncHistory();
             }
+
+            if (isFlushUpdate) {
+                this.pendingFlushRequests.delete(path);
+                if (this.pendingFlushRequests.size === 0) {
+                    if (this.flushTimeout) clearTimeout(this.flushTimeout);
+                    new obsidian.Notice("Flush sync complete! All files updated.");
+                }
+            }
         } catch (e) {
             console.error("Error applying file update:", e);
         } finally {
@@ -2739,6 +2829,220 @@ class LocalSyncPlugin extends obsidian.Plugin {
             console.error("Error applying file deletion:", e);
         } finally {
             this.isSyncing = false;
+        }
+    }
+
+    async initiateFlush() {
+        new obsidian.Notice("Initiating vault flush to network...");
+        const manifest = await this.generateManifest();
+        this.broadcastMessage({ type: 'FLUSH_MANIFEST', manifest });
+        new obsidian.Notice("Vault flush broadcasted.");
+    }
+
+    async reconcileFlushManifest(remoteManifest) {
+        new obsidian.Notice("Receiving flush sync from remote...");
+        
+        // Failsafe backup
+        await this.createVaultBackup();
+
+        const localManifest = await this.generateManifest();
+
+        // 1. Delete files not present in the remote manifest
+        for (const path in localManifest) {
+            if (!(path in remoteManifest)) {
+                await this.processIncomingFileDelete(path);
+            }
+        }
+
+        // 2. Identify files to request
+        const filesToRequest = [];
+        for (const path in remoteManifest) {
+            const remoteMtime = remoteManifest[path];
+            const localMtime = localManifest[path];
+            
+            // If file does not exist locally, or modified time is different, request it.
+            if (!localMtime || localMtime !== remoteMtime) {
+                filesToRequest.push(path);
+            }
+        }
+
+        if (filesToRequest.length === 0) {
+            new obsidian.Notice("Flush sync complete (already up to date).");
+            return;
+        }
+
+        // Initialize pending flush requests track
+        this.pendingFlushRequests = new Set(filesToRequest);
+        
+        // Setup timeout to clear pending requests if it takes too long (e.g. 60 seconds)
+        if (this.flushTimeout) clearTimeout(this.flushTimeout);
+        this.flushTimeout = setTimeout(() => {
+            if (this.pendingFlushRequests && this.pendingFlushRequests.size > 0) {
+                this.pendingFlushRequests.clear();
+                new obsidian.Notice("Flush sync timed out.");
+            }
+        }, 60000);
+
+        // 3. Request each file
+        for (const path of filesToRequest) {
+            this.broadcastMessage({ type: 'REQUEST_FILE', path });
+        }
+    }
+
+    async createVaultBackup() {
+        try {
+            const backupDir = '.obsidian/local-sync-backups';
+            if (!(await this.app.vault.adapter.exists(backupDir))) {
+                await this.app.vault.adapter.mkdir(backupDir);
+            }
+
+            const timestamp = Date.now();
+            const currentBackupDir = `${backupDir}/backup_${timestamp}`;
+            await this.app.vault.adapter.mkdir(currentBackupDir);
+
+            const files = this.app.vault.getFiles();
+            const manifest = {};
+            let counter = 1;
+
+            for (const file of files) {
+                const path = file.path;
+                if (path.startsWith('.obsidian')) continue;
+
+                try {
+                    const content = await this.app.vault.adapter.read(path);
+                    const backupFileName = `${counter}.old`;
+                    await this.app.vault.adapter.write(`${currentBackupDir}/${backupFileName}`, content);
+                    
+                    manifest[backupFileName] = path;
+                    counter++;
+                } catch (e) {
+                    console.error(`Failed to backup file: ${path}`, e);
+                }
+            }
+
+            await this.app.vault.adapter.write(`${currentBackupDir}/manifest.old`, JSON.stringify(manifest));
+
+            await this.cleanupOldBackups();
+
+            new obsidian.Notice("Local vault backup created.");
+        } catch (e) {
+            console.error("Failed to create backup", e);
+            new obsidian.Notice("Failed to create vault backup.");
+        }
+    }
+
+    async cleanupOldBackups() {
+        try {
+            const backups = await this.getBackupList();
+            const maxKeep = this.settings.maxBackups || 5;
+            if (backups.length > maxKeep) {
+                const backupsToDelete = backups.slice(maxKeep);
+                for (const backupFolderName of backupsToDelete) {
+                    await this.deleteBackup(backupFolderName);
+                }
+            }
+        } catch (e) {
+            console.error("Failed to clean up old backups", e);
+        }
+    }
+
+    async getBackupList() {
+        const backupDir = '.obsidian/local-sync-backups';
+        try {
+            if (!(await this.app.vault.adapter.exists(backupDir))) {
+                return [];
+            }
+            const listed = await this.app.vault.adapter.list(backupDir);
+            return listed.folders
+                .map(f => {
+                    const parts = f.split('/');
+                    return parts[parts.length - 1];
+                })
+                .filter(name => name.startsWith('backup_'))
+                .sort((a, b) => {
+                    const timeA = parseInt(a.replace('backup_', '')) || 0;
+                    const timeB = parseInt(b.replace('backup_', '')) || 0;
+                    return timeB - timeA;
+                });
+        } catch (e) {
+            console.error("Failed to list backups", e);
+            return [];
+        }
+    }
+
+    async restoreBackup(backupFolderName) {
+        if (!confirm(`Are you sure you want to restore the backup "${backupFolderName}"? This will overwrite your current vault files.`)) {
+            return;
+        }
+
+        this.isSyncing = true;
+        try {
+            const backupPath = `.obsidian/local-sync-backups/${backupFolderName}`;
+            const manifestPath = `${backupPath}/manifest.old`;
+            if (!(await this.app.vault.adapter.exists(manifestPath))) {
+                new obsidian.Notice("Backup manifest not found.");
+                return;
+            }
+
+            const manifest = JSON.parse(await this.app.vault.adapter.read(manifestPath));
+
+            // 1. Delete all current files (excluding .obsidian)
+            const files = this.app.vault.getFiles();
+            for (const file of files) {
+                if (file.path.startsWith('.obsidian')) continue;
+                try {
+                    await this.app.vault.delete(file);
+                } catch (e) {
+                    console.error("Failed to delete file during restore", e);
+                }
+            }
+
+            // 2. Restore files from backup
+            for (const backupFileName in manifest) {
+                const originalPath = manifest[backupFileName];
+                const backupFilePath = `${backupPath}/${backupFileName}`;
+                try {
+                    if (await this.app.vault.adapter.exists(backupFilePath)) {
+                        const content = await this.app.vault.adapter.read(backupFilePath);
+                        
+                        const parts = originalPath.split('/');
+                        if (parts.length > 1) {
+                            const parentPath = parts.slice(0, -1).join('/');
+                            if (!(await this.app.vault.adapter.exists(parentPath))) {
+                                await this.app.vault.adapter.mkdir(parentPath);
+                            }
+                        }
+
+                        await this.app.vault.create(originalPath, content);
+                    }
+                } catch (e) {
+                    console.error(`Failed to restore file: ${originalPath}`, e);
+                }
+            }
+
+            new obsidian.Notice("Vault restored successfully!");
+        } catch (e) {
+            console.error("Restore failed", e);
+            new obsidian.Notice("Failed to restore vault.");
+        } finally {
+            this.isSyncing = false;
+        }
+    }
+
+    async deleteBackup(backupFolderName) {
+        try {
+            const backupPath = `.obsidian/local-sync-backups/${backupFolderName}`;
+            if (await this.app.vault.adapter.exists(backupPath)) {
+                const listed = await this.app.vault.adapter.list(backupPath);
+                for (const file of listed.files) {
+                    await this.app.vault.adapter.remove(file);
+                }
+                await this.app.vault.adapter.rmdir(backupPath, true);
+                new obsidian.Notice(`Deleted backup ${backupFolderName}`);
+            }
+        } catch (e) {
+            console.error("Failed to delete backup", e);
+            new obsidian.Notice("Failed to delete backup.");
         }
     }
 }
@@ -2811,6 +3115,79 @@ class LocalSyncSettingTab extends obsidian.PluginSettingTab {
                     this.plugin.settings.serverPort = parseInt(value) || 8080;
                     await this.plugin.saveSettings();
                 }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Live Sync')
+            .setDesc('Sync file modifications, creations, and deletions in real-time.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.liveSync)
+                .onChange(async (value) => {
+                    this.plugin.settings.liveSync = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Flush Files to Network')
+            .setDesc('Push this device\'s files as the main ones, replacing all files on connected devices.')
+            .addButton(button => button
+                .setButtonText('Flush Files')
+                .setWarning()
+                .onClick(async () => {
+                    if (confirm("Are you sure you want to flush? This will replace all files on other devices with this device's files.")) {
+                        await this.plugin.initiateFlush();
+                    }
+                }));
+
+        new obsidian.Setting(containerEl)
+            .setName('Max Backups')
+            .setDesc('Number of backups to keep before deleting the oldest ones.')
+            .addText(text => text
+                .setPlaceholder('5')
+                .setValue(String(this.plugin.settings.maxBackups || 5))
+                .onChange(async (value) => {
+                    this.plugin.settings.maxBackups = parseInt(value) || 5;
+                    await this.plugin.saveSettings();
+                }));
+
+        const backupListContainer = containerEl.createDiv();
+        backupListContainer.createEl('h3', {text: 'Available Backups'});
+
+        this.plugin.getBackupList().then(backups => {
+            if (backups.length === 0) {
+                backupListContainer.createEl('p', {
+                    text: 'No backups found. Backups are automatically created before remote files are flushed.',
+                    cls: 'setting-item-description'
+                });
+                return;
+            }
+
+            for (const backup of backups) {
+                const timestampMs = parseInt(backup.replace('backup_', ''));
+                const dateStr = isNaN(timestampMs) ? backup : new Date(timestampMs).toLocaleString();
+                
+                const backupRow = backupListContainer.createDiv({cls: 'setting-item'});
+                
+                const infoDiv = backupRow.createDiv({cls: 'setting-item-info'});
+                infoDiv.createDiv({cls: 'setting-item-name', text: dateStr});
+                infoDiv.createDiv({cls: 'setting-item-description', text: `Folder: ${backup}`});
+                
+                const controlDiv = backupRow.createDiv({cls: 'setting-item-control'});
+                
+                const restoreBtn = controlDiv.createEl('button', {text: 'Restore'});
+                restoreBtn.addEventListener('click', async () => {
+                    await this.plugin.restoreBackup(backup);
+                    this.display();
+                });
+                
+                const deleteBtn = controlDiv.createEl('button', {text: 'Delete', cls: 'mod-warning'});
+                deleteBtn.addEventListener('click', async () => {
+                    if (confirm(`Are you sure you want to delete backup "${backup}"?`)) {
+                        await this.plugin.deleteBackup(backup);
+                        this.display();
+                    }
+                });
+            }
+        });
     }
 }
 
