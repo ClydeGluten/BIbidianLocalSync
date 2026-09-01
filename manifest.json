@@ -4,7 +4,7 @@
   "version": "2.0.0",
   "minAppVersion": "1.11.4",
   "description": "Synchronize an Obsidian vault over a local network with authenticated encrypted sessions.",
-  "author": "Antigravity",
+  "author": "Vibecoded with Codex and Antigravity",
   "authorUrl": "",
   "isDesktopOnly": false
 }
