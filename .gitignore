@@ -1,6 +1,9 @@
 # Obsidian plugin local data
 data.json
 .obsidian/
+node_modules/
+coverage/
+*.log
 
 # vim backup files
 *.un~

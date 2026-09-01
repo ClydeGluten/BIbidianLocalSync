@@ -1,9 +1,9 @@
 {
-  "id": "obsidian-local-sync",
+  "id": "local-vault-sync",
   "name": "Local Vault Sync",
-  "version": "1.0.4",
-  "minAppVersion": "0.15.0",
-  "description": "Sync your Obsidian vault securely over the local network using WebSockets.",
+  "version": "2.0.0",
+  "minAppVersion": "1.11.4",
+  "description": "Synchronize an Obsidian vault over a local network with authenticated encrypted sessions.",
   "author": "Antigravity",
   "authorUrl": "",
   "isDesktopOnly": false
